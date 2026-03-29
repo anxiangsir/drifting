@@ -70,6 +70,12 @@ Try the interactive toy demo to see the algorithm in action:
 ## Table of Contents
 
 - [Repository Structure](#repository-structure)
+- [Training Pipeline & Evaluation Metrics (Detailed)](#training-pipeline--evaluation-metrics-detailed)
+  - [Architecture Overview](#architecture-overview)
+  - [Phase 1 — MAE Pretraining (Feature Extractor)](#phase-1--mae-pretraining-feature-extractor)
+  - [Phase 2 — Generator Training](#phase-2--generator-training)
+  - [Evaluation Metrics](#evaluation-metrics)
+  - [Testing / Inference Flow](#testing--inference-flow)
 - [Quick Start (Inference)](#quick-start-inference)
 - [Pretrained Models](#pretrained-models)
 - [Environment Setup](#environment-setup)
@@ -110,6 +116,258 @@ Try the interactive toy demo to see the algorithm in action:
     ├── main.py
     └── requirements.txt
 ```
+
+## Training Pipeline & Evaluation Metrics (Detailed)
+
+### Architecture Overview
+
+The Drifting project consists of two training phases: first train an MAE feature extractor (one-time), then use it to drive the Generator training.
+
+```
+                    ┌─────────────────────────────────────┐
+                    │  Phase 1: MAE Pretraining (one-time) │
+                    │  - Data: ImageNet train (augmented)   │
+                    │  - Loss: Reconstruction MSE           │
+                    │        + optional cls cross-entropy    │
+                    │  - Eval: val reconstruction loss       │
+                    │  - Output: ResNet backbone params      │
+                    └────────────────┬────────────────────┘
+                                     │ frozen feature extractor
+                    ┌────────────────▼────────────────────┐
+                    │  Phase 2: Generator Training          │
+                    │  - Data: ImageNet train (no augment)  │
+                    │  - Loss: Drift Loss (feature space)   │
+                    │      positive attraction + negative    │
+                    │      repulsion                         │
+                    │  - Eval (every 5 000 steps):          │
+                    │    • FID (primary, lower is better)    │
+                    │    • IS  (higher is better)            │
+                    │    • Precision / Recall                │
+                    │  - Params: EMA params used for eval    │
+                    └───────────────────────────────────────┘
+```
+
+---
+
+### Phase 1 — MAE Pretraining (Feature Extractor)
+
+**Purpose.** Train a Masked Autoencoder (MAE) whose ResNet backbone will serve as the frozen feature extractor during Generator training.  The feature extractor measures the semantic distance between generated images and real images.
+
+**Training flow:**
+
+```
+ImageNet images (256×256)
+      ↓  random crop / augmentation
+      ↓  random masking (mask_ratio: 50 %)
+   MAE encoder (ResNet backbone)
+      ↓
+   MAE decoder (shallow Transformer decoder)
+      ↓
+   Reconstruction loss (MSE on masked patches)
+      + optional cls classification head loss (finetune_last_steps)
+```
+
+**Key configuration** (`configs/mae/latent_640.yaml`):
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `batch_size` | 8 192 | Global batch size |
+| `learning_rate` | 0.004 | AdamW learning rate |
+| `mask_ratio_min` / `mask_ratio_max` | 0.5 / 0.5 | Mask ratio range (both set to 0.5 = fixed 50 %) |
+| `total_steps` | 200 000 | Total training steps |
+| `finetune_last_steps` | 3 000 | Last 3 000 steps add cls loss for fine-tuning |
+| `warmup_finetune` | 1 000 | Warm-up steps for cls loss ramp-up |
+| `finetune_cls` | 0.1 | Target cls loss weight at the end of fine-tuning |
+| `ema_decay` | 0.9995 | EMA parameter update rate |
+| `eval_per_step` | 2 000 | Evaluate on validation set every 2 000 steps |
+
+**Metrics recorded during MAE training:**
+
+| Metric | Description |
+|--------|-------------|
+| `loss` | Reconstruction loss (MSE on masked patches) |
+| `loss_cls` | Classification loss (only during fine-tuning phase) |
+| `lr` | Current learning rate |
+| `g_norm` | Gradient norm (monitors training stability) |
+
+Evaluation is run every `eval_per_step` on the validation set with: (1) masking enabled, (2) masking disabled, for both current params and EMA params.
+
+---
+
+### Phase 2 — Generator Training
+
+#### Core Idea
+
+The generator (DiT architecture) produces images whose features should *drift* toward real image features in the feature space, while being *repelled* by unconditional (negative) image features.
+
+#### Training Step (per iteration)
+
+```
+Each training step:
+1. Load a batch of real images (images, labels) from DataLoader
+2. Push images into two memory banks:
+   - positive bank: stored per class (class-conditional, 1 000 classes)
+   - negative bank: stored with label=0 (unconditional, all classes mixed)
+3. Sample from memory banks:
+   - positive_samples [B, pos_per_sample, H, W, C]: same-class real images
+   - negative_samples [B, neg_per_sample, H, W, C]: unconditional real images
+4. Extract features with frozen MAE backbone:
+   - sg_features = MAE(positive_samples + negative_samples)   ← stop_gradient
+5. Generator forward pass:
+   - Sample CFG scale ∈ [cfg_min, cfg_max] (log-uniform)
+   - gen_samples = Generator(labels, cfg_scale)['samples']
+   - Shape: (B × gen_per_label, H, W, C)
+   - gen_features = MAE(gen_samples)   ← gradients flow through
+6. Compute Drift Loss (in feature space)
+7. Backward pass + gradient clipping + AdamW update
+8. Update EMA parameters
+```
+
+#### Memory Bank Mechanism
+
+```
+positive bank:  Per-class ring buffer (classes 0–999), storing real images
+                max_size = 128 per class, push_per_step = 64 images
+negative bank:  All classes mixed (labels set to 0)
+                max_size = 1 000, stores unconditional images
+```
+
+Each step, `positive_samples` are drawn from the matching class buffer and `negative_samples` from the mixed buffer.
+
+#### Drift Loss
+
+This is the core algorithm.  In **feature space**:
+
+```python
+# Inputs:
+# gen:        generated image features  [B, C_g, D]   (C_g = gen_per_label)
+# fixed_pos:  positive sample features  [B, C_p, D]   (C_p = pos_per_sample, real same-class images)
+# fixed_neg:  negative sample features  [B, C_n, D]   (C_n = neg_per_sample, unconditional images)
+# weight_neg: negative weight = (cfg - 1) * (gen_per_label - 1) / C_n
+```
+
+Computation outline (targets are computed under `stop_gradient`; `old_gen` refers to the current generated features detached from the graph, used to compute the drift target):
+
+1. **Pairwise distances** — `dist = cdist(old_gen, targets)`, normalized by overall mean distance as scale.
+2. **Multi-scale force computation** — For each bandwidth `R ∈ [0.02, 0.05, 0.2]`:
+   - Compute affinity matrix: `affinity = sqrt(softmax(-dist/R, dim=-1) × softmax(-dist/R, dim=-2))`
+   - Separate positive (attraction) and negative (repulsion) contributions
+   - Compute net force: `force = Σ(aff_pos × pos_targets) − Σ(aff_neg × neg_targets)`
+   - Normalize and accumulate force across bandwidths
+3. **Target position** — `goal = old_gen + accumulated_force`
+4. **Loss** — `MSE(gen_scaled, goal_scaled)` — push generated features toward the target position.
+
+**Physical intuition:** Generated features are *attracted* to real same-class features and *repelled* from unconditional features, causing them to continuously *drift* toward the real data distribution.
+
+#### Generator Key Configuration (`configs/gen/latent_sota_L.yaml`)
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `batch_size` | 2 048 | Global batch size |
+| `train_batch_size` | 128 | Per-step batch for Drift Loss |
+| `gen_per_label` | 64 | Generate 64 images per label |
+| `pos_per_sample` | 64 | Sample 64 positives per label |
+| `neg_per_sample` | 32 | Sample 32 negatives per label |
+| `cfg_min` / `cfg_max` | 1.0 / 4.0 | CFG scale random range |
+| `no_cfg_frac` | 0.5 | 50 % of samples forced to cfg=1.0 exactly (overrides cfg_min/cfg_max) |
+| `R_list` | [0.2, 0.05, 0.02] | Three bandwidths for multi-scale force |
+| `total_steps` | 200 000 | Total training steps |
+| `eval_per_step` | 5 000 | FID evaluation every 5 000 steps |
+| `ema_decay` | 0.999 | EMA decay rate |
+| `positive_bank_size` | 128 | Max samples per class in positive bank |
+| `negative_bank_size` | 1 000 | Max samples in negative bank |
+| `push_per_step` | 64 | Images pushed to memory bank per step |
+
+---
+
+### Evaluation Metrics
+
+#### 1. FID (Fréchet Inception Distance) ⭐ Primary Metric
+
+```
+1. Generate 50 000 images using val-set class labels
+2. Extract InceptionV3 pool3 features (2 048-d) for all generated images
+3. Compute mean μ_gen and covariance Σ_gen of generated distribution
+4. Compare against precomputed ImageNet-256 real statistics (μ_ref, Σ_ref)
+5. FID = ‖μ_gen − μ_ref‖² + Tr(Σ_gen + Σ_ref − 2√(Σ_gen · Σ_ref))
+```
+
+**Lower FID is better.**  Best reported result: FID = 1.53 (Drift-L, latent, CFG=1.0).
+
+#### 2. IS (Inception Score)
+
+```
+1. Use InceptionV3 classification logits (1 000 classes)
+2. For each image compute class probability p(y|x)
+3. Compute marginal distribution p(y) = E[p(y|x)]
+4. IS = exp( E[ KL(p(y|x) ‖ p(y)) ] )
+   Computed over 10 splits, report mean ± std
+```
+
+**Higher IS is better.**  Best reported result: IS = 260.1 (Drift-L).
+
+#### 3. Precision & Recall (only when `num_samples ≥ 50 000`)
+
+```
+Precision: fraction of generated images falling within the real-data manifold (quality)
+Recall:    fraction of the real-data manifold covered by generated images (diversity)
+Estimated using k=3 nearest neighbours
+```
+
+#### 4. Auxiliary Metrics (logged during training)
+
+| Metric | Description |
+|--------|-------------|
+| `loss` | Drift Loss total value |
+| `loss_R/0.02`, `loss_R/0.05`, `loss_R/0.2` | Force magnitude at each bandwidth |
+| `scale` | Feature-space normalization scale |
+| `g_norm` | Gradient norm (training stability) |
+| `lr` | Current learning rate |
+| `kimg` | Images processed so far (in thousands) |
+| `best_fid` | Best FID across all CFG values this round |
+| `best_cfg` | CFG scale that achieved the best FID |
+
+---
+
+### Testing / Inference Flow
+
+#### Online Evaluation (during training, every `eval_per_step`)
+
+```python
+# Evaluate across a range of CFG scales:
+cfg_list = [1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0, 2.5, 3.0, 3.5]
+
+for eval_cfg in cfg_list:
+    # 1. Use EMA parameters (not current training params)
+    eval_params = ema_to_params(state.ema_params)
+    # 2. Generate images using ImageNet val class labels
+    gen_samples = Generator(labels=val_labels, cfg_scale=eval_cfg)['samples']
+    # 3. Post-processing (latent → pixel: VAE decoding)
+    # 4. Compute FID / IS  (and Precision / Recall when n_samples ≥ 50 000)
+    # 5. Record best_fid and best_cfg
+```
+
+#### Offline Inference (`inference.py`)
+
+```bash
+cd jax
+python inference.py \
+  --init-from "hf://latent_L_sota" \
+  --cfg-scale 1.0 \
+  --num-samples 50000 \
+  --eval-batch-size 256
+```
+
+Steps:
+
+1. Load pretrained EMA parameters from HuggingFace
+2. Load ImageNet val set as class-label source
+3. Generate images in batches, VAE-decode (for latent models) to 256×256 RGB
+4. Extract InceptionV3 features
+5. Compute FID / IS / Precision / Recall
+6. Output JSON results (`fid`, `isc_mean`, `isc_std`, `precision`, `recall`)
+
+---
 
 ## Quick Start (Inference)
 
