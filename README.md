@@ -10,7 +10,7 @@
   <img src="assets/teaser_main.png" width="90%" alt="Drifting Models overview" />
 </p>
 
-Official codebase for the ImageNet experiments of *Generative Modeling via Drifting*.
+Official codebase for the ImageNet experiments of [*Generative Modeling via Drifting*](http://arxiv.org/abs/2602.04770) (Deng*, Li*, Li, Du & He, 2026).
 We provide training, inference, and pretrained weights for one-step image generation on ImageNet 256×256.
 
 This repository contains **two independent implementations** of the Drift framework:
@@ -21,6 +21,120 @@ This repository contains **two independent implementations** of the Drift framew
 | [`torch/`](torch/) | PyTorch | Re-implementation |
 
 Root-level directories (`assets/`, `configs/`, `notebooks/`) are shared between both implementations.
+
+---
+
+## Method Overview
+
+### What is Drifting?
+
+**Drifting** is a new paradigm for generative modeling that produces high-quality images in a **single forward pass** (1 NFE — Number of Function Evaluations). Unlike diffusion models that require tens to thousands of iterative denoising steps, a Drifting generator maps random noise directly to photorealistic images in one shot, achieving state-of-the-art FID 1.54 on ImageNet 256×256.
+
+The core idea is conceptually simple: instead of learning to reverse a noising process, the generator is trained so that its output distribution **drifts** toward the real data distribution. During training, each generated sample is simultaneously **attracted** toward real images of the same class (positive anchors) and **repelled** from unrelated images (negative anchors). These attraction–repulsion forces, computed across multiple scales, gradually sculpt the generator's output distribution until it matches the data.
+
+### Key Technical Components
+
+#### 1. Drift Loss — Attraction & Repulsion in Feature Space
+
+The drift loss is the heart of the method. It operates entirely in **feature space** (not pixel space) to capture high-level semantics.
+
+**How it works:**
+
+1. A batch of images is generated from random noise via the generator.
+2. Both generated and real images are passed through a frozen MAE (Masked Autoencoder) feature extractor to obtain multi-scale feature representations.
+3. For each generated sample, **positive anchors** (real images from the same class) and **negative anchors** (unconditional/cross-class images) are drawn from the memory bank.
+4. Pairwise distances are computed between generated features and anchor features, yielding **soft affinities** via a softmax over distances:
+
+$$\text{affinity}(i, j) = \sqrt{\text{softmax}_{\text{row}}\!\left(-\frac{d_{ij}}{R}\right) \cdot \text{softmax}_{\text{col}}\!\left(-\frac{d_{ij}}{R}\right)}$$
+
+5. These affinities define directional forces: positive anchors **pull** the generated sample closer, while negative anchors **push** it away. The forces are combined into a **goal position** for each generated sample.
+6. The loss is simply the MSE between the current generated features and the goal (with stop-gradient on the goal, so only the generator is updated).
+
+**Multi-scale design:** The loss is computed at multiple temperature scales $R \in \{0.02, 0.05, 0.2\}$, enabling the generator to learn both fine-grained details (small $R$) and global structure (large $R$) simultaneously.
+
+#### 2. Memory Bank — Efficient Anchor Storage
+
+A **class-wise circular buffer** stores real image features for each of the 1000 ImageNet classes. During each training step:
+
+- **Push:** A batch of real images is added to the memory bank (both class-specific positive bank and a shared negative bank).
+- **Sample:** For each training label, positive anchors are sampled from the same class, and negative anchors are sampled unconditionally.
+
+This design decouples the batch size from the number of anchor comparisons, allowing rich positive/negative supervision (e.g., 64 positive + 16 negative anchors per sample) without enormous batch sizes.
+
+#### 3. Generator Architecture — Adapted DiT (Diffusion Transformer)
+
+The generator is a **Diffusion Transformer (DiT)** repurposed for one-step generation:
+
+| Component | Details |
+|-----------|---------|
+| **Backbone** | Transformer with adaptive Layer Norm (adaLN-Zero) |
+| **Variants** | DiT-B (768 hidden, 12 layers) / DiT-L (1024 hidden, 24 layers) |
+| **Input** | Random noise (Gaussian), either in pixel space or VAE latent space |
+| **Conditioning** | Class label embedding via learnable tokens (16 class tokens concatenated to the sequence) |
+| **Attention** | Multi-head self-attention with QK-norm, RoPE, and optional FP32 precision |
+| **MLP** | SwiGLU activation with 4× expansion ratio |
+| **Normalization** | RMSNorm (instead of standard LayerNorm) |
+
+At inference time, the generator takes in pure Gaussian noise and a class label, and outputs an image in a single pass. Classifier-Free Guidance (CFG) is supported by running two forward passes (conditional + unconditional) and interpolating:
+
+$$x_{\text{out}} = x_{\text{unc}} + s \cdot (x_{\text{cond}} - x_{\text{unc}})$$
+
+#### 4. MAE Feature Extractor — Semantic Supervision Signal
+
+A **ResNet-based Masked Autoencoder (MAE)** is pre-trained via self-supervised learning on ImageNet to serve as the feature extractor for the drift loss:
+
+- **Architecture:** ResNet-50 backbone with configurable channel width (256 for ablation, 640 for SOTA).
+- **Training:** Masked image modeling — reconstructs 50% randomly masked patches from the remaining visible patches.
+- **Usage during generator training:** The MAE is **frozen**; only its multi-scale feature maps (layers 1–4 + global tokens) are extracted. This provides 5 complementary views of each image, from low-level textures (layer 1) to high-level semantics (layer 4 / global tokens).
+
+The MAE can operate in **latent space** (on 4-channel VAE-encoded representations) or **pixel space** (on raw RGB images).
+
+#### 5. Training Pipeline
+
+Training proceeds in two stages:
+
+**Stage 1 — MAE Pretraining (optional):** Train the ResNet-based MAE on ImageNet via masked image reconstruction. Pre-trained weights are provided on HuggingFace, so this step is optional.
+
+**Stage 2 — Generator Training:**
+
+```
+For each training step:
+  1. Push a batch of real images into the memory bank (positive + negative)
+  2. Sample positive & negative anchors from the memory bank
+  3. Sample random noise and a CFG scale from [cfg_min, cfg_max]
+  4. Generate images via the DiT generator (one forward pass)
+  5. Extract frozen MAE features from generated + anchor images
+  6. Compute multi-scale drift loss across all feature levels
+  7. Backpropagate and update generator (AdamW + gradient clipping)
+  8. Update EMA (Exponential Moving Average) parameters
+  9. Periodically evaluate FID on the EMA model at multiple CFG scales
+```
+
+**Key training hyperparameters (SOTA configuration):**
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `total_steps` | 200,000 | Total training iterations |
+| `batch_size` | 2,048 (global) | Distributed across 128 TPU v6e |
+| `pos_per_sample` | 64 | Positive anchors per generated sample |
+| `neg_per_sample` | 32 | Negative anchors per generated sample |
+| `gen_per_label` | 64 | Samples generated per class label per step |
+| `R_list` | [0.02, 0.05, 0.2] | Multi-scale temperature values |
+| `cfg_min / cfg_max` | 1.0 / 4.0 | CFG scale sampling range during training |
+| `ema_decay` | 0.999 | EMA coefficient |
+| `learning_rate` | 4e-4 | AdamW learning rate (constant after warmup) |
+
+### How is Drifting Different from Diffusion?
+
+| Aspect | Diffusion / Flow Matching | Drifting |
+|--------|--------------------------|----------|
+| **Generation steps** | 10–1000 iterative steps | **1 step** (single forward pass) |
+| **Training signal** | Predict noise / velocity field | Attraction–repulsion forces from real samples |
+| **Loss space** | Pixel or noise space | **Feature space** (via frozen MAE) |
+| **Noise schedule** | Required (timestep-dependent) | **None** — no timestep concept |
+| **Memory bank** | Not needed | Class-wise anchor storage |
+| **Architecture** | U-Net or DiT | DiT (adapted) |
+| **ImageNet-256 FID** | ~1.5–2.0 (multi-step) | **1.54** (single step) |
 
 ## Generated Samples
 
@@ -69,6 +183,10 @@ Try the interactive toy demo to see the algorithm in action:
 
 ## Table of Contents
 
+- [Method Overview](#method-overview)
+  - [What is Drifting?](#what-is-drifting)
+  - [Key Technical Components](#key-technical-components)
+  - [How is Drifting Different from Diffusion?](#how-is-drifting-different-from-diffusion)
 - [Repository Structure](#repository-structure)
 - [Quick Start (Inference)](#quick-start-inference)
 - [Pretrained Models](#pretrained-models)
